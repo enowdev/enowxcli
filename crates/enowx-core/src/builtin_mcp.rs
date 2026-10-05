@@ -11,6 +11,7 @@
 pub mod coolify;
 pub mod dokploy;
 pub mod rag;
+pub mod rag_db;
 pub mod vps;
 
 use std::{collections::BTreeMap, path::PathBuf};
@@ -208,10 +209,14 @@ pub fn server(name: &str) -> Result<Box<dyn Server>> {
             let setup = config
                 .rag
                 .context("rag is not set up; open Settings > RAG, or run `enx mcp set rag`")?;
-            let dsn = auth
-                .key(&rag_dsn_id(), &[])
-                .map(|(key, _)| key)
-                .context("no database stored for rag; open Settings > RAG")?;
+            let stored_dsn = auth.key(&rag_dsn_id(), &[]).map(|(key, _)| key);
+            let backend = setup.effective_database_backend(stored_dsn.is_some())?;
+            let dsn = match backend {
+                rag::DatabaseBackend::Embedded => None,
+                rag::DatabaseBackend::Postgres => {
+                    Some(stored_dsn.context("no database stored for rag; open Settings > RAG")?)
+                }
+            };
             // A local endpoint (Ollama, LM Studio) needs no key.
             let key = match setup.provider() {
                 rag::Provider::Custom => auth
@@ -220,7 +225,7 @@ pub fn server(name: &str) -> Result<Box<dyn Server>> {
                     .unwrap_or_default(),
                 _ => token("rag")?,
             };
-            Box::new(rag::Rag::new(&dsn, &key, &setup)?)
+            Box::new(rag::Rag::new(backend, dsn.as_deref(), &key, &setup)?)
         }
         other => bail!(
             "enx has no built-in MCP server `{other}` (built in: {})",

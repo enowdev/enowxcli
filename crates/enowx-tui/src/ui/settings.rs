@@ -207,9 +207,8 @@ fn placeholder(app: &App, field: SettingsField) -> &'static str {
                 Provider::Custom => "optional for a local endpoint",
             }
         }
-        SettingsField::Dsn if app.modal == Modal::Rag => {
-            "postgres://localhost/enx or a cloud URL (blank keeps the stored one)"
-        }
+        SettingsField::Dsn if app.modal == Modal::Rag => "Postgres only; blank retains a saved DSN",
+        SettingsField::DatabaseBackend => "←→ Embedded / Postgres",
         SettingsField::ApiKey if stored => "(stored; type to replace it)",
         SettingsField::ApiKey => "(empty)",
         SettingsField::ModelsUrl => "https://host/v1/models",

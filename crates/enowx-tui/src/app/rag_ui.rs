@@ -23,10 +23,20 @@ impl App {
             .rag
             .unwrap_or_default();
         let provider = setup.provider();
+        let auth = enowx_core::auth::Auth::load().unwrap_or_default();
+        let has_dsn = auth.key(&rag_dsn_id(), &[]).is_some();
+        let backend = setup
+            .effective_database_backend(has_dsn)
+            .unwrap_or_else(|_| rag::DatabaseBackend::Postgres);
         self.settings = crate::modal::SettingsDraft {
             provider_id: "rag".into(),
             name: "rag".into(),
             rag_enabled: if self.rag_on() { "on" } else { "off" }.into(),
+            database_backend: match backend {
+                rag::DatabaseBackend::Embedded => "embedded",
+                rag::DatabaseBackend::Postgres => "postgres",
+            }
+            .into(),
             rag_provider: provider.id().into(),
             base_url: setup.base_url.clone(),
             model: setup.model.clone(),
@@ -54,7 +64,12 @@ impl App {
         let mut auth = enowx_core::auth::Auth::load()?;
         let dsn = self.settings.dsn.trim().to_owned();
         let key = self.settings.api_key.trim().to_owned();
-        if !dsn.is_empty() && !dsn.starts_with("postgres://") && !dsn.starts_with("postgresql://") {
+        let embedded = setup.database == Some(rag::DatabaseBackend::Embedded);
+        if !embedded
+            && !dsn.is_empty()
+            && !dsn.starts_with("postgres://")
+            && !dsn.starts_with("postgresql://")
+        {
             self.modal_error = "the database must be a postgres:// connection string".into();
             return Ok(());
         }
@@ -64,9 +79,12 @@ impl App {
         }
         let has_dsn = !dsn.is_empty() || auth.key(&rag_dsn_id(), &[]).is_some();
         let has_key = !key.is_empty() || auth.key(&secret_id("rag"), &[]).is_some();
-        // What turning it on needs; off, anything may be left blank.
-        if on && !has_dsn {
-            self.modal_error = "a database is needed to turn RAG on".into();
+        if embedded && !rag::DatabaseBackend::embedded_supported() {
+            self.modal_error = "embedded RAG is not supported on this target".into();
+            return Ok(());
+        }
+        if on && !embedded && !has_dsn {
+            self.modal_error = "a database is needed to turn RAG on with Postgres".into();
             return Ok(());
         }
         if on && !has_key && provider != rag::Provider::Custom {
@@ -76,7 +94,7 @@ impl App {
             );
             return Ok(());
         }
-        if !dsn.is_empty() {
+        if !embedded && !dsn.is_empty() {
             auth.store(&rag_dsn_id(), &dsn)?;
         }
         if !key.is_empty() {
@@ -91,7 +109,6 @@ impl App {
         config.save()?;
         enowx_core::persist::set_mcp_enabled("rag", on)?;
         self.adopt(self.config.clone());
-        // The form stays, its secrets cleared: they are stored now.
         self.settings.dsn.clear();
         self.settings.api_key.clear();
         self.field_cursor = 0;

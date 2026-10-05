@@ -4,6 +4,10 @@ All notable changes to enowx. Dates are YYYY-MM-DD.
 
 ## Unreleased
 
+### Code search database
+
+- **RAG selects a persistent embedded PostgreSQL database by default** on Linux GNU x86_64/aarch64, macOS arm64 and Windows x86_64. `enowx mcp set rag --database postgres --dsn ...` selects external PostgreSQL; a stored legacy DSN without a saved backend continues to select PostgreSQL. Unsupported release targets remain PostgreSQL-only. The embedded owner is shared across enowx processes and shuts down after 60 idle seconds; Windows uses an ephemeral loopback listener with trust authentication, accessible to local processes that can connect.
+
 ## v0.2.2 (2026-10-03)
 
 ### Renamed to enowx

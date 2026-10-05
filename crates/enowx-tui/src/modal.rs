@@ -150,6 +150,8 @@ pub enum SettingsField {
     Password,
     /// RAG on or off.
     RagEnabled,
+    /// RAG's persistent database backend.
+    DatabaseBackend,
     /// Where RAG's embeddings come from: Voyage, OpenAI, or a custom
     /// OpenAI-compatible endpoint.
     RagProvider,
@@ -324,6 +326,7 @@ impl SettingsField {
             SettingsField::User => "SSH user",
             SettingsField::Port => "SSH port",
             SettingsField::Dsn => "Database (Postgres with pgvector)",
+            SettingsField::DatabaseBackend => "Database backend",
             SettingsField::KeyFile => "Key file (optional)",
             SettingsField::Passphrase => "Key passphrase (if it has one)",
             SettingsField::Password => "Password (optional)",
@@ -366,6 +369,7 @@ impl SettingsField {
                 | SettingsField::Vision
                 | SettingsField::RagEnabled
                 | SettingsField::AutoIndex
+                | SettingsField::DatabaseBackend
                 | SettingsField::TeamEnabled
                 | SettingsField::TeamMessages
                 | SettingsField::TeamBoard
@@ -448,11 +452,13 @@ pub fn team_fields(enabled: bool) -> &'static [SettingsField] {
 
 /// The fields of Settings > RAG for a provider: a known provider's models,
 /// widths and rerankers are picked; a custom endpoint's are typed.
-pub fn rag_fields(provider: &str) -> &'static [SettingsField] {
-    use enowx_core::builtin_mcp::rag::Provider;
-    match Provider::parse(provider) {
-        Provider::Voyage => &[
+pub fn rag_fields(provider: &str, backend: &str) -> &'static [SettingsField] {
+    use enowx_core::builtin_mcp::rag::{DatabaseBackend, Provider};
+    let postgres = backend == "postgres" || !DatabaseBackend::embedded_supported();
+    match (Provider::parse(provider), postgres) {
+        (Provider::Voyage, true) => &[
             SettingsField::RagEnabled,
+            SettingsField::DatabaseBackend,
             SettingsField::Dsn,
             SettingsField::RagProvider,
             SettingsField::ApiKey,
@@ -461,8 +467,19 @@ pub fn rag_fields(provider: &str) -> &'static [SettingsField] {
             SettingsField::Rerank,
             SettingsField::AutoIndex,
         ],
-        Provider::OpenAi => &[
+        (Provider::Voyage, false) => &[
             SettingsField::RagEnabled,
+            SettingsField::DatabaseBackend,
+            SettingsField::RagProvider,
+            SettingsField::ApiKey,
+            SettingsField::EmbedModel,
+            SettingsField::Dimension,
+            SettingsField::Rerank,
+            SettingsField::AutoIndex,
+        ],
+        (Provider::OpenAi, true) => &[
+            SettingsField::RagEnabled,
+            SettingsField::DatabaseBackend,
             SettingsField::Dsn,
             SettingsField::RagProvider,
             SettingsField::ApiKey,
@@ -470,9 +487,30 @@ pub fn rag_fields(provider: &str) -> &'static [SettingsField] {
             SettingsField::Dimension,
             SettingsField::AutoIndex,
         ],
-        Provider::Custom => &[
+        (Provider::OpenAi, false) => &[
             SettingsField::RagEnabled,
+            SettingsField::DatabaseBackend,
+            SettingsField::RagProvider,
+            SettingsField::ApiKey,
+            SettingsField::EmbedModel,
+            SettingsField::Dimension,
+            SettingsField::AutoIndex,
+        ],
+        (Provider::Custom, true) => &[
+            SettingsField::RagEnabled,
+            SettingsField::DatabaseBackend,
             SettingsField::Dsn,
+            SettingsField::RagProvider,
+            SettingsField::EmbedUrl,
+            SettingsField::ApiKey,
+            SettingsField::EmbedModelText,
+            SettingsField::DimensionText,
+            SettingsField::RerankText,
+            SettingsField::AutoIndex,
+        ],
+        (Provider::Custom, false) => &[
+            SettingsField::RagEnabled,
+            SettingsField::DatabaseBackend,
             SettingsField::RagProvider,
             SettingsField::EmbedUrl,
             SettingsField::ApiKey,
@@ -511,6 +549,8 @@ pub struct SettingsDraft {
     /// (empty for the model's default) and the reranker (empty for the
     /// provider's default, "off" for none). The model is in `model`.
     pub rag_enabled: String,
+    /// The selected RAG database: `embedded` or `postgres`.
+    pub database_backend: String,
     /// "off" to stop indexing by itself; anything else is on.
     pub auto_index: String,
     pub rag_provider: String,
@@ -569,6 +609,7 @@ impl SettingsDraft {
             SettingsField::KeyFile => &self.key_file,
             SettingsField::Passphrase => &self.passphrase,
             SettingsField::Password => &self.api_key,
+            SettingsField::DatabaseBackend => &self.database_backend,
             SettingsField::RagEnabled => &self.rag_enabled,
             SettingsField::RagProvider => &self.rag_provider,
             SettingsField::EmbedModel | SettingsField::EmbedModelText => &self.model,
@@ -603,6 +644,7 @@ impl SettingsDraft {
             SettingsField::Host => &mut self.base_url,
             SettingsField::User => &mut self.models_url,
             SettingsField::Port => &mut self.context_window,
+            SettingsField::DatabaseBackend => &mut self.database_backend,
             SettingsField::Dsn => &mut self.dsn,
             SettingsField::KeyFile => &mut self.key_file,
             SettingsField::Passphrase => &mut self.passphrase,
@@ -636,6 +678,11 @@ impl SettingsDraft {
         use enowx_core::builtin_mcp::rag::{Provider, RagSetup};
         let provider = Provider::parse(&self.rag_provider);
         RagSetup {
+            database: match self.database_backend.as_str() {
+                "embedded" => Some(enowx_core::builtin_mcp::rag::DatabaseBackend::Embedded),
+                "postgres" => Some(enowx_core::builtin_mcp::rag::DatabaseBackend::Postgres),
+                _ => None,
+            },
             provider: provider.id().to_owned(),
             base_url: if provider == Provider::Custom {
                 self.base_url.trim().to_owned()
@@ -645,7 +692,6 @@ impl SettingsDraft {
             model: self.model.trim().to_owned(),
             dimension: self.dimension.trim().parse().unwrap_or(0),
             rerank: self.rerank.trim().to_owned(),
-            // Saved only when off: on is the default.
             auto_index: (self.auto_index == "off").then_some(false),
         }
     }
@@ -720,6 +766,10 @@ impl SettingsDraft {
                     .label()
                     .into()
             }
+            SettingsField::DatabaseBackend => match self.database_backend.as_str() {
+                "postgres" => "Postgres".into(),
+                _ => "Embedded".into(),
+            },
             SettingsField::EmbedModel => self.rag_setup().model(),
             SettingsField::Dimension => self.rag_setup().dimension().to_string(),
             SettingsField::Rerank => self.rag_setup().reranker().unwrap_or_else(|| "off".into()),
@@ -737,6 +787,20 @@ impl SettingsDraft {
                 let len = options.len() as i32;
                 let next = (((here as i32 + delta) % len) + len) % len;
                 self.effort = options[next as usize].clone();
+            }
+            SettingsField::DatabaseBackend => {
+                use enowx_core::builtin_mcp::rag::DatabaseBackend;
+                let options = if DatabaseBackend::embedded_supported() {
+                    ["embedded", "postgres"].as_slice()
+                } else {
+                    ["postgres"].as_slice()
+                };
+                let here = options
+                    .iter()
+                    .position(|v| *v == self.database_backend)
+                    .unwrap_or(0) as i32;
+                let next = (here + delta).rem_euclid(options.len() as i32);
+                self.database_backend = options[next as usize].to_string();
             }
             SettingsField::RagEnabled => {
                 self.rag_enabled = if self.rag_enabled == "on" {

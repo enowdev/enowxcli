@@ -3,13 +3,12 @@
 
 use std::io::{BufRead as _, IsTerminal as _, Write as _};
 
+use crate::auth::read_key;
 use anyhow::{bail, Context as _, Result};
 use enowx_core::{
     auth::Auth,
-    builtin_mcp::{self, secret_id, vps, BuiltinConfig, Endpoint},
+    builtin_mcp::{self, rag, secret_id, vps, BuiltinConfig, Endpoint},
 };
-
-use crate::auth::read_key;
 
 /// A visible answer, typed or piped.
 fn read_line(prompt: &str) -> Result<String> {
@@ -25,15 +24,25 @@ fn read_line(prompt: &str) -> Result<String> {
 /// `enx mcp list`: each built-in server and whether it is installed.
 pub fn list() -> Result<()> {
     let config = BuiltinConfig::load()?;
+    let auth = Auth::load()?;
     for name in builtin_mcp::NAMES {
         let detail = match name {
             "coolify" => config.coolify.as_ref().map(|e| e.base_url.clone()),
             "dokploy" => config.dokploy.as_ref().map(|e| e.base_url.clone()),
-            "rag" => config
-                .rag
-                .as_ref()
-                .map(|_| "Voyage AI + pgvector".to_owned()),
-            _ if config.vps.is_empty() => None,
+            "rag" => config.rag.as_ref().map(|setup| {
+                let has_dsn = auth.is_stored(&builtin_mcp::rag_dsn_id());
+                let backend = setup
+                    .effective_database_backend(has_dsn)
+                    .unwrap_or(rag::DatabaseBackend::Postgres);
+                format!(
+                    "{} + {}",
+                    setup.provider().label(),
+                    match backend {
+                        rag::DatabaseBackend::Embedded => "embedded PostgreSQL",
+                        rag::DatabaseBackend::Postgres => "PostgreSQL",
+                    }
+                )
+            }),
             _ => Some(format!(
                 "{} VPS: {}",
                 config.vps.len(),
@@ -63,7 +72,9 @@ fn install_hint(name: &str) -> &'static str {
     match name {
         "vps" => "vps add <name> --host <address> --user <user>",
         "coolify" => "mcp set coolify --url <url> --token <token>",
-        "rag" => "mcp set rag --dsn <postgres://...> --token <voyage key>",
+        "rag" => {
+            "mcp set rag [--database embedded|postgres] [--dsn <postgres://...>] [--token <key>]"
+        }
         _ => "mcp set dokploy --url <url> --token <token>",
     }
 }
@@ -126,9 +137,10 @@ pub fn install(name: &str, url: Option<String>, token: Option<String>) -> Result
     Ok(())
 }
 
-/// `enx mcp set rag`: the database (a Postgres with pgvector, local or
-/// cloud) and the Voyage AI key. Both are secrets and go to auth.json.
+/// `enx mcp set rag`: the selected database and embedding setup. Secrets
+/// remain in `auth.json`.
 pub struct RagArgs {
+    pub database: Option<String>,
     pub dsn: Option<String>,
     pub token: Option<String>,
     pub url: Option<String>,
@@ -143,10 +155,37 @@ pub struct RagArgs {
 /// model, width and reranker. What is left out keeps its current value; a
 /// new provider starts on its own defaults.
 pub fn set_rag(args: RagArgs) -> Result<()> {
-    use enowx_core::builtin_mcp::{rag, rag_dsn_id};
+    let requested_backend = args
+        .database
+        .as_deref()
+        .map(|database| match database {
+            "embedded" => Ok(rag::DatabaseBackend::Embedded),
+            "postgres" => Ok(rag::DatabaseBackend::Postgres),
+            _ => bail!("database must be embedded or postgres"),
+        })
+        .transpose()?;
+    anyhow::ensure!(
+        !(requested_backend == Some(rag::DatabaseBackend::Embedded) && args.dsn.is_some()),
+        "--database embedded cannot be used with --dsn"
+    );
     let mut auth = Auth::load()?;
     let mut config = BuiltinConfig::load()?;
     let mut setup = config.rag.clone().unwrap_or_default();
+    let stored_dsn = auth
+        .key(&builtin_mcp::rag_dsn_id(), &[])
+        .map(|(value, _)| value);
+    let backend = if let Some(backend) = requested_backend {
+        backend
+    } else if args.dsn.is_some() {
+        rag::DatabaseBackend::Postgres
+    } else {
+        setup.effective_database_backend(stored_dsn.is_some())?
+    };
+    anyhow::ensure!(
+        backend != rag::DatabaseBackend::Embedded || rag::DatabaseBackend::embedded_supported(),
+        "embedded RAG is not supported on this target"
+    );
+    setup.database = Some(backend);
     if let Some(provider) = &args.provider {
         let provider = rag::Provider::parse(provider);
         if provider != setup.provider() {
@@ -174,22 +213,28 @@ pub fn set_rag(args: RagArgs) -> Result<()> {
     if let Some(auto) = args.auto_index {
         setup.auto_index = (auto == "off").then_some(false);
     }
+    setup.database = Some(backend);
     setup.check()?;
     let provider = setup.provider();
 
-    let dsn = match args.dsn {
-        Some(dsn) => Some(dsn),
-        None if auth.key(&rag_dsn_id(), &[]).is_some() => None,
-        None => Some(read_key("Postgres connection string (postgres://...): ")?),
+    let dsn_label = if backend == rag::DatabaseBackend::Postgres {
+        let dsn = match args.dsn {
+            Some(dsn) => Some(dsn),
+            None if stored_dsn.is_some() => None,
+            None => Some(read_key("Postgres connection string (postgres://...): ")?),
+        };
+        if let Some(dsn) = dsn {
+            let dsn = dsn.trim().to_owned();
+            anyhow::ensure!(
+                dsn.starts_with("postgres://") || dsn.starts_with("postgresql://"),
+                "the database must be a postgres:// connection string"
+            );
+            auth.store(&builtin_mcp::rag_dsn_id(), &dsn)?;
+        }
+        "PostgreSQL"
+    } else {
+        "embedded PostgreSQL"
     };
-    if let Some(dsn) = dsn {
-        let dsn = dsn.trim().to_owned();
-        anyhow::ensure!(
-            dsn.starts_with("postgres://") || dsn.starts_with("postgresql://"),
-            "the database must be a postgres:// connection string"
-        );
-        auth.store(&rag_dsn_id(), &dsn)?;
-    }
     let token = match args.token {
         Some(token) => Some(token),
         None if auth.key(&secret_id("rag"), &[]).is_some() => None,
@@ -216,10 +261,11 @@ pub fn set_rag(args: RagArgs) -> Result<()> {
     config.save()?;
     enowx_core::persist::set_mcp_enabled("rag", true)?;
     println!(
-        "Configured rag ({}, {}, {} dimensions, reranker {}) and turned it on. Its search skill is offered to agents now.",
+        "Configured rag ({}, {}, {} dimensions, {}, reranker {}) and turned it on. Its search skill is offered to agents now.",
         provider.label(),
         setup.model(),
         setup.dimension(),
+        dsn_label,
         setup.reranker().unwrap_or_else(|| "off".into())
     );
     Ok(())

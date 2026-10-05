@@ -72,6 +72,43 @@ jobs:
             enowx-${{ matrix.target }}.tar.gz*
             enowx-${{ matrix.target }}.zip*
 
+
+  embedded-build:
+    name: embedded ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest, smoke: true }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm, smoke: true }
+          - { target: aarch64-apple-darwin, os: macos-latest, smoke: true }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest, smoke: true }
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest, smoke: false }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm, smoke: false }
+          - { target: x86_64-apple-darwin, os: macos-latest, smoke: false }
+          - { target: aarch64-pc-windows-msvc, os: windows-11-arm, smoke: false }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: embedded-${{ matrix.target }}
+
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }} -p enowx-cli
+
+      - name: Embedded RAG vector startup/query smoke
+        if: matrix.smoke
+        run: cargo test --locked --target ${{ matrix.target }} -p enowx-cli --test rag_database -- embedded_vector_smoke --exact
   release:
     needs: build
     if: startsWith(github.ref, 'refs/tags/v')

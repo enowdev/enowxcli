@@ -60,37 +60,71 @@ fn the_model_and_width_are_picked_from_the_providers() {
 }
 
 #[test]
-fn a_custom_endpoint_is_typed_and_saved_off_without_a_key() {
+fn a_custom_endpoint_saves_enabled_with_embedded_storage_without_a_key() {
     let mut app = rag_page();
+    let supported = enowx_core::builtin_mcp::rag::DatabaseBackend::embedded_supported();
+    if !supported {
+        return;
+    }
+    assert!(screen(&mut app).contains("Embedded"));
     go_to(&mut app, "Embedding provider");
     app.press_key(KeyCode::Right).unwrap();
     app.press_key(KeyCode::Right).unwrap();
-    assert!(screen(&mut app).contains("Custom (OpenAI-compatible)"));
     go_to(&mut app, "Base URL");
     app.type_keys("http://localhost:11434/v1");
     go_to(&mut app, "Embedding model");
     app.type_keys("nomic-embed-text");
     go_to(&mut app, "Dimension");
-    app.type_keys("768");
+    app.type_keys("3");
+    go_to(&mut app, "Code search (RAG)");
+    app.press_key(KeyCode::Right).unwrap();
     app.press_key(KeyCode::Enter).unwrap();
     let rag = BuiltinConfig::load().unwrap().rag.expect("saved");
     assert_eq!(rag.provider, "custom");
-    assert_eq!(rag.base_url, "http://localhost:11434/v1");
-    assert_eq!(rag.model, "nomic-embed-text");
-    assert_eq!(rag.dimension, 768);
+    assert_eq!(
+        rag.database,
+        Some(enowx_core::builtin_mcp::rag::DatabaseBackend::Embedded)
+    );
     assert!(app.is_modal_open(), "the section stays open");
 }
 
 #[test]
-fn turning_it_on_needs_a_database() {
+fn postgres_enabled_without_a_dsn_is_rejected() {
     let mut app = rag_page();
-    app.press_key(KeyCode::Right).unwrap(); // RAG: on
+    go_to(&mut app, "Database backend");
+    if enowx_core::builtin_mcp::rag::DatabaseBackend::embedded_supported() {
+        app.press_key(KeyCode::Right).unwrap();
+    }
+    go_to(&mut app, "Code search (RAG)");
+    app.press_key(KeyCode::Right).unwrap();
     app.press_key(KeyCode::Enter).unwrap();
-    assert!(
-        screen(&mut app).contains("a database is needed"),
-        "{}",
-        screen(&mut app)
-    );
+    assert!(screen(&mut app).contains("database is needed"));
+}
+
+#[test]
+fn legacy_dsn_selects_postgres_and_switching_to_embedded_preserves_it() {
+    let mut app = rag_page();
+    let mut auth = enowx_core::auth::Auth::load().unwrap();
+    auth.store(
+        &enowx_core::builtin_mcp::rag_dsn_id(),
+        "postgres://user:secret@localhost/db",
+    )
+    .unwrap();
+    app.run_command("/rag").expect("reopen RAG");
+    assert!(screen(&mut app).contains("Postgres"));
+    if enowx_core::builtin_mcp::rag::DatabaseBackend::embedded_supported() {
+        go_to(&mut app, "Database backend");
+        app.press_key(KeyCode::Right).unwrap();
+        app.press_key(KeyCode::Enter).unwrap();
+        let saved = enowx_core::auth::Auth::load().unwrap();
+        assert_eq!(
+            saved
+                .key(&enowx_core::builtin_mcp::rag_dsn_id(), &[])
+                .map(|(value, _)| value)
+                .as_deref(),
+            Some("postgres://user:secret@localhost/db")
+        );
+    }
 }
 
 /// Enter in a built-in server's form saves it (it used to do nothing).

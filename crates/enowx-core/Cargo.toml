@@ -40,6 +40,23 @@ tree-sitter-python = "0.25.0"
 tree-sitter-go = "0.25.0"
 tree-sitter-json = "0.24.8"
 tree-sitter-css = "0.25.0"
+fs2 = "0.4"
+
+[target.x86_64-unknown-linux-gnu.dependencies]
+oliphaunt = "0.3.0"
+oliphaunt-extension-vector = "0.3.0"
+
+[target.aarch64-unknown-linux-gnu.dependencies]
+oliphaunt = "0.3.0"
+oliphaunt-extension-vector = "0.3.0"
+
+[target.aarch64-apple-darwin.dependencies]
+oliphaunt = "0.3.0"
+oliphaunt-extension-vector = "0.3.0"
+
+[target.x86_64-pc-windows-msvc.dependencies]
+oliphaunt = "0.3.0"
+oliphaunt-extension-vector = "0.3.0"
 
 [target.'cfg(unix)'.dependencies]
 nix.workspace = true

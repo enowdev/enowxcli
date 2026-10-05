@@ -816,7 +816,7 @@ impl App {
         if self.modal == crate::modal::Modal::BuiltinMcp {
             crate::modal::builtin_mcp_fields(&self.settings.provider_id)
         } else if self.modal == crate::modal::Modal::Rag {
-            crate::modal::rag_fields(&self.settings.rag_provider)
+            crate::modal::rag_fields(&self.settings.rag_provider, &self.settings.database_backend)
         } else if self.modal == crate::modal::Modal::Team {
             crate::modal::team_fields(self.settings.team_enabled == "on")
         } else if matches!(

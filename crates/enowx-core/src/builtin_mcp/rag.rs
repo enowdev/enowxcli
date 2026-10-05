@@ -122,10 +122,49 @@ impl Provider {
     }
 }
 
+/// The database used to store the RAG index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DatabaseBackend {
+    Embedded,
+    Postgres,
+}
+
+impl DatabaseBackend {
+    /// Whether Oliphaunt's embedded PostgreSQL is built for this exact target.
+    pub fn embedded_supported() -> bool {
+        cfg!(any(
+            all(
+                target_arch = "x86_64",
+                target_os = "linux",
+                target_env = "gnu"
+            ),
+            all(
+                target_arch = "aarch64",
+                target_os = "linux",
+                target_env = "gnu"
+            ),
+            all(
+                target_arch = "aarch64",
+                target_vendor = "apple",
+                target_os = "macos"
+            ),
+            all(
+                target_arch = "x86_64",
+                target_os = "windows",
+                target_env = "msvc"
+            ),
+        ))
+    }
+}
+
 /// The non-secret half of the setup. The DSN and the API key are secrets and
 /// live in `auth.json`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RagSetup {
+    /// Explicit database choice; absent in legacy setups.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database: Option<DatabaseBackend>,
     /// `voyage` (the default), `openai` or `custom`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub provider: String,
@@ -154,6 +193,22 @@ fn is_zero(n: &usize) -> bool {
 }
 
 impl RagSetup {
+    /// Resolve an explicit choice or the historical DSN-based default.
+    pub fn effective_database_backend(&self, has_postgres_dsn: bool) -> Result<DatabaseBackend> {
+        let backend = self.database.unwrap_or_else(|| {
+            if has_postgres_dsn || !DatabaseBackend::embedded_supported() {
+                DatabaseBackend::Postgres
+            } else {
+                DatabaseBackend::Embedded
+            }
+        });
+        anyhow::ensure!(
+            backend != DatabaseBackend::Embedded || DatabaseBackend::embedded_supported(),
+            "embedded RAG is not supported on this target"
+        );
+        Ok(backend)
+    }
+
     pub fn provider(&self) -> Provider {
         Provider::parse(&self.provider)
     }
@@ -249,7 +304,8 @@ fn table(dim: usize) -> String {
 }
 
 pub struct Rag {
-    dsn: String,
+    backend: DatabaseBackend,
+    dsn: Option<String>,
     /// The embedding API's key; may be empty for a local endpoint.
     key: String,
     setup: RagSetup,
@@ -295,13 +351,63 @@ struct Synced {
     replaced: u64,
 }
 
-impl Rag {
-    pub fn new(dsn: &str, key: &str, setup: &RagSetup) -> Result<Self> {
-        setup.check()?;
+/// A session-level PostgreSQL advisory lock. Dropping the driver closes the
+/// dedicated session, which releases its lock on error or cancellation.
+struct AdvisorySession {
+    client: tokio_postgres::Client,
+    driver: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl AdvisorySession {
+    async fn acquire(&self, key: i64) -> Result<()> {
+        self.client
+            .query_one("SELECT pg_advisory_lock($1)", &[&key])
+            .await?;
+        Ok(())
+    }
+
+    async fn release(&self, key: i64) -> Result<()> {
+        let released: bool = self
+            .client
+            .query_one("SELECT pg_advisory_unlock($1)", &[&key])
+            .await?
+            .get(0);
         anyhow::ensure!(
-            dsn.starts_with("postgres://") || dsn.starts_with("postgresql://"),
-            "the database must be a postgres:// connection string"
+            released,
+            "PostgreSQL advisory lock was not held by this session"
         );
+        Ok(())
+    }
+}
+
+impl Drop for AdvisorySession {
+    fn drop(&mut self) {
+        if let Some(driver) = self.driver.take() {
+            driver.abort();
+        }
+    }
+}
+
+fn advisory_key(namespace: &str) -> i64 {
+    // FNV-1a is stable across platforms and process runs (unlike DefaultHasher).
+    stable_hash(namespace) as i64
+}
+
+impl Rag {
+    pub fn new(
+        backend: DatabaseBackend,
+        dsn: Option<&str>,
+        key: &str,
+        setup: &RagSetup,
+    ) -> Result<Self> {
+        setup.check()?;
+        if backend == DatabaseBackend::Postgres {
+            let dsn = dsn.context("no database stored for rag; open Settings > RAG")?;
+            anyhow::ensure!(
+                dsn.starts_with("postgres://") || dsn.starts_with("postgresql://"),
+                "the database must be a postgres:// connection string"
+            );
+        }
         // Canonical, as `root` makes a folder a tool names: the project id
         // hashes the path, and the background sync and a search must agree.
         let workspace = std::env::var_os("ENX_WORKSPACE")
@@ -310,7 +416,12 @@ impl Rag {
             .unwrap_or_else(|| PathBuf::from("."));
         let workspace = std::fs::canonicalize(&workspace).unwrap_or(workspace);
         Ok(Self {
-            dsn: dsn.trim().to_owned(),
+            backend,
+            dsn: if backend == DatabaseBackend::Postgres {
+                dsn.map(|value| value.trim().to_owned())
+            } else {
+                None
+            },
             key: key.trim().to_owned(),
             model: setup.model(),
             dim: setup.dimension(),
@@ -331,9 +442,9 @@ impl Rag {
         })
     }
 
-    /// A connection, opened once and reopened after it drops. TLS follows
-    /// the DSN's `sslmode`: `prefer` (the default) uses it when the server
-    /// offers it, `require` insists, `disable` never tries.
+    /// A connection, opened once and reopened after it drops. Embedded
+    /// PostgreSQL is started lazily and uses its local, trust-authenticated
+    /// endpoint; external PostgreSQL retains the DSN's rustls behavior.
     async fn db(&self) -> Result<Arc<tokio_postgres::Client>> {
         let mut slot = self.db.lock().await;
         if let Some(client) = slot.as_ref() {
@@ -341,29 +452,132 @@ impl Rag {
                 return Ok(client.clone());
             }
         }
-        let config: tokio_postgres::Config =
-            self.dsn.parse().context("the database connection string")?;
-        let mut roots = rustls::RootCertStore::empty();
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-        let connector = tokio_postgres_rustls::MakeRustlsConnect::new(tls);
-        let (client, connection) =
-            tokio::time::timeout(Duration::from_secs(20), config.connect(connector))
+        let (client, driver, lease) = match self.backend {
+            DatabaseBackend::Embedded => {
+                let (endpoint, lease) = super::rag_db::ensure_server().await?;
+                let config: tokio_postgres::Config =
+                    endpoint.parse().context("the embedded database endpoint")?;
+                let (client, connection) = tokio::time::timeout(
+                    Duration::from_secs(20),
+                    config.connect(tokio_postgres::NoTls),
+                )
                 .await
                 .context("no answer from the database within 20 seconds")?
-                .context("connecting to the database")?;
-        tokio::spawn(async move {
-            let _ = connection.await;
-        });
+                .context("connecting to embedded PostgreSQL")?;
+                (
+                    client,
+                    tokio::spawn(async move {
+                        let _ = connection.await;
+                    }),
+                    Some(lease),
+                )
+            }
+            DatabaseBackend::Postgres => {
+                let config: tokio_postgres::Config = self
+                    .dsn
+                    .as_deref()
+                    .context("no PostgreSQL connection string")?
+                    .parse()
+                    .context("the database connection string")?;
+                let mut roots = rustls::RootCertStore::empty();
+                roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+                let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+                    rustls::crypto::ring::default_provider(),
+                ))
+                .with_safe_default_protocol_versions()?
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+                let connector = tokio_postgres_rustls::MakeRustlsConnect::new(tls);
+                let (client, connection) =
+                    tokio::time::timeout(Duration::from_secs(20), config.connect(connector))
+                        .await
+                        .context("no answer from the database within 20 seconds")?
+                        .context("connecting to the database")?;
+                (
+                    client,
+                    tokio::spawn(async move {
+                        let _ = connection.await;
+                    }),
+                    None,
+                )
+            }
+        };
+        // The client and its driver are live, so readiness is established;
+        // release the startup lease before opening another local session.
+        drop(lease);
         let client = Arc::new(client);
-        prepare(&client, self.dim).await?;
+        let prepared = async {
+            let schema_lock = self.lock_session().await?;
+            let key = advisory_key("enx-rag-schema-v1");
+            schema_lock.acquire(key).await?;
+            prepare(&client, self.dim).await?;
+            schema_lock.release(key).await?;
+            drop(schema_lock);
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        if let Err(error) = prepared {
+            driver.abort();
+            return Err(error);
+        }
         *slot = Some(client.clone());
         Ok(client)
+    }
+
+    /// Opens an independent session, used for session-level advisory locks.
+    async fn lock_session(&self) -> Result<AdvisorySession> {
+        let (client, driver) = match self.backend {
+            DatabaseBackend::Embedded => {
+                let (endpoint, _lease) = super::rag_db::ensure_server().await?;
+                let config: tokio_postgres::Config =
+                    endpoint.parse().context("the embedded database endpoint")?;
+                let (client, connection) = tokio::time::timeout(
+                    Duration::from_secs(20),
+                    config.connect(tokio_postgres::NoTls),
+                )
+                .await
+                .context("no answer from the database within 20 seconds")?
+                .context("connecting to embedded PostgreSQL")?;
+                (
+                    client,
+                    tokio::spawn(async move {
+                        let _ = connection.await;
+                    }),
+                )
+            }
+            DatabaseBackend::Postgres => {
+                let config: tokio_postgres::Config = self
+                    .dsn
+                    .as_deref()
+                    .context("no PostgreSQL connection string")?
+                    .parse()
+                    .context("the database connection string")?;
+                let mut roots = rustls::RootCertStore::empty();
+                roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+                let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+                    rustls::crypto::ring::default_provider(),
+                ))
+                .with_safe_default_protocol_versions()?
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+                let connector = tokio_postgres_rustls::MakeRustlsConnect::new(tls);
+                let (client, connection) =
+                    tokio::time::timeout(Duration::from_secs(20), config.connect(connector))
+                        .await
+                        .context("no answer from the database within 20 seconds")?
+                        .context("connecting to the database")?;
+                (
+                    client,
+                    tokio::spawn(async move {
+                        let _ = connection.await;
+                    }),
+                )
+            }
+        };
+        Ok(AdvisorySession {
+            client,
+            driver: Some(driver),
+        })
     }
 
     /// Embed `inputs` as documents or as a query.
@@ -510,6 +724,9 @@ impl Rag {
     async fn sync(&self, root: &Path, only: Option<Vec<String>>) -> Result<Synced> {
         let _one = self.syncing.lock().await;
         let project = project_id(root);
+        let project_lock = self.lock_session().await?;
+        let project_key = advisory_key(&format!("enx-rag-project-v1:{project}"));
+        project_lock.acquire(project_key).await?;
         let embedder = self.setup.embedder();
         let db = self.db().await?;
         let t = table(self.dim);
@@ -673,9 +890,10 @@ impl Rag {
                 }
             }
         }
+        project_lock.release(project_key).await?;
+        drop(project_lock);
         Ok(report)
     }
-
     /// Sync what changed since the last sync of `root`: every file the
     /// first time, then only files whose size or mtime moved, or that
     /// appeared or went. Cheap when nothing changed: a walk and a stat.
@@ -921,8 +1139,12 @@ impl Rag {
     }
 
     async fn forget(&self, args: &Value) -> Result<String> {
+        let _one = self.syncing.lock().await;
         let root = self.root(args)?;
         let project = project_id(&root);
+        let project_lock = self.lock_session().await?;
+        let project_key = advisory_key(&format!("enx-rag-project-v1:{project}"));
+        project_lock.acquire(project_key).await?;
         let db = self.db().await?;
         let removed = db
             .execute(
@@ -930,6 +1152,8 @@ impl Rag {
                 &[&project],
             )
             .await?;
+        project_lock.release(project_key).await?;
+        drop(project_lock);
         Ok(format!("Removed {removed} chunks of {}.", root.display()))
     }
 }
@@ -1394,7 +1618,13 @@ mod tests {
     use super::*;
 
     fn rag_in(workspace: &Path) -> Rag {
-        let mut rag = Rag::new("postgres://localhost/none", "", &RagSetup::default()).unwrap();
+        let mut rag = Rag::new(
+            DatabaseBackend::Postgres,
+            Some("postgres://localhost/none"),
+            "",
+            &RagSetup::default(),
+        )
+        .unwrap();
         rag.workspace = std::fs::canonicalize(workspace).unwrap();
         rag
     }
@@ -1435,7 +1665,13 @@ mod tests {
             auto_index: Some(false),
             ..Default::default()
         };
-        let mut rag = Rag::new("postgres://localhost/none", "", &setup).unwrap();
+        let mut rag = Rag::new(
+            DatabaseBackend::Postgres,
+            Some("postgres://localhost/none"),
+            "",
+            &setup,
+        )
+        .unwrap();
         rag.workspace = std::fs::canonicalize(&dir).unwrap();
         rag.notified("notifications/enx/changed", &json!({ "files": ["x.rs"] }));
         assert!(rag.queued.lock().unwrap().is_empty());
@@ -1514,6 +1750,40 @@ mod tests {
         let old: RagSetup = serde_json::from_str("{}").unwrap();
         assert_eq!(old, RagSetup::default());
         assert_eq!(serde_json::to_string(&RagSetup::default()).unwrap(), "{}");
+    }
+
+    #[test]
+    fn backend_resolution_preserves_legacy_dsn_and_supported_default() {
+        let setup = RagSetup::default();
+        let expected = if DatabaseBackend::embedded_supported() {
+            DatabaseBackend::Embedded
+        } else {
+            DatabaseBackend::Postgres
+        };
+        assert_eq!(setup.effective_database_backend(false).unwrap(), expected);
+        assert_eq!(
+            setup.effective_database_backend(true).unwrap(),
+            DatabaseBackend::Postgres
+        );
+        let explicit = RagSetup {
+            database: Some(DatabaseBackend::Embedded),
+            ..Default::default()
+        };
+        assert_eq!(
+            explicit.effective_database_backend(true).is_ok(),
+            DatabaseBackend::embedded_supported()
+        );
+    }
+
+    #[test]
+    fn backend_serializes_lowercase_and_round_trips() {
+        let setup = RagSetup {
+            database: Some(DatabaseBackend::Embedded),
+            ..Default::default()
+        };
+        let encoded = serde_json::to_string(&setup).unwrap();
+        assert!(encoded.contains("\"database\":\"embedded\""));
+        assert_eq!(serde_json::from_str::<RagSetup>(&encoded).unwrap(), setup);
     }
 
     #[test]

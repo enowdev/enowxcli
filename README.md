@@ -293,14 +293,17 @@ Other MCP clients can run them too: the command is `enowx mcp serve coolify`
 
 ### Code search (`rag`)
 
-`rag` indexes the workspace into Postgres with the pgvector extension and
-lets agents search it by meaning. It has a section of its own in Settings
+`rag` indexes the workspace into a persistent database with the pgvector
+extension and lets agents search it by meaning. On supported builds the default
+is embedded PostgreSQL shared by enowx processes on the same machine. Its files
+live under `~/.enx/rag-db/cluster` and remain on disk when the owner shuts down.
+Elsewhere the default is external PostgreSQL. You can choose the backend in Settings
 (`Ctrl+P`, then RAG, or `/rag`):
 
 | Field | Choices |
 |---|---|
 | Code search (RAG) | on or off (off by default) |
-| Database | a Postgres with pgvector, local (`postgres://localhost/enowx`) or cloud (Neon, Supabase, RDS, with `?sslmode=require`) |
+| Database | Embedded (supported builds) or PostgreSQL; PostgreSQL can be local (`postgres://localhost/enowx`) or cloud (Neon, Supabase, RDS, with `?sslmode=require`) |
 | Embedding provider | Voyage AI, OpenAI, or Custom: any OpenAI-compatible `/embeddings` endpoint (Ollama, LM Studio, Jina, Mistral, a gateway) |
 | API key | the provider's; optional for a local endpoint |
 | Embedding model | picked from the provider's (`voyage-code-3`, `voyage-3.5`, `text-embedding-3-small`, ...), typed for a custom endpoint |
@@ -311,10 +314,25 @@ lets agents search it by meaning. It has a section of its own in Settings
 The same from the CLI, which an agent can run for you:
 
 ```sh
-enowx mcp set rag --dsn postgres://localhost/enowx --token <voyage key>
-enowx mcp set rag --provider openai --model text-embedding-3-large --dimension 1024 --token <key>
+# Supported builds default to embedded; no DSN is needed.
 enowx mcp set rag --provider custom --url http://localhost:11434/v1 --model nomic-embed-text --dimension 768
+
+# Select external PostgreSQL explicitly and provide its connection string.
+enowx mcp set rag --database postgres --dsn 'postgres://user:password@db.example/enowx?sslmode=require' --token <voyage key>
+
+# On a supported build, this also explicitly selects the embedded backend.
+enowx mcp set rag --database embedded --provider openai --model text-embedding-3-large --dimension 1024 --token <key>
 ```
+
+`--dsn` without `--database` selects PostgreSQL. Existing setups that have a
+saved DSN but no backend selection continue to use PostgreSQL; selecting
+Embedded does not erase that saved DSN or migrate either database. Builds
+without embedded support default to PostgreSQL and reject an Embedded choice.
+Embedded support is provided for Linux GNU x86_64/aarch64, macOS arm64, and
+Windows x86_64; Linux musl, macOS Intel, and Windows ARM64 use PostgreSQL.
+Windows embedded PostgreSQL listens only on an ephemeral loopback port and
+uses trust authentication: any local process able to connect to that port can
+access the embedded RAG data. It never listens beyond loopback.
 
 Files are cut along their syntax (tree-sitter for Rust, TypeScript,
 JavaScript, Python, Go, JSON and CSS): a function, a type, a class method or

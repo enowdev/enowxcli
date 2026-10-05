@@ -92,9 +92,8 @@ enum McpCommand {
     /// Each built-in server and whether it is installed.
     #[command(alias = "ls")]
     List,
-    /// Fill in a built-in server's credentials: coolify or dokploy take a URL
-    /// and an API token (asked at a prompt, or given with --token so an agent
-    /// can set it up). This turns the server on.
+    /// Configure a built-in server: panels take a URL and token; rag selects
+    /// embedded storage by default where supported, or PostgreSQL with --dsn.
     #[command(alias = "install")]
     Set {
         name: String,
@@ -104,6 +103,9 @@ enum McpCommand {
         /// prompted for.
         #[arg(long)]
         token: Option<String>,
+        /// rag only: select embedded or postgres storage.
+        #[arg(long, value_parser = ["embedded", "postgres"])]
+        database: Option<String>,
         /// rag only: the Postgres connection string, local or cloud.
         #[arg(long)]
         dsn: Option<String>,
@@ -245,6 +247,7 @@ async fn main() -> Result<()> {
                 url,
                 token,
                 dsn,
+                database,
                 provider,
                 model,
                 dimension,
@@ -254,6 +257,7 @@ async fn main() -> Result<()> {
                 if name == "rag" {
                     mcp::set_rag(mcp::RagArgs {
                         dsn,
+                        database,
                         token,
                         url,
                         provider,
@@ -267,6 +271,9 @@ async fn main() -> Result<()> {
                 }
             }
             McpCommand::Clear { name } => mcp::uninstall(&name),
+            McpCommand::Serve { name } if name == "rag-db" => {
+                enowx_core::builtin_mcp::rag_db::serve().await
+            }
             McpCommand::Serve { name } => enowx_core::builtin_mcp::serve(&name).await,
         },
         Command::Vps { command } => match command {
